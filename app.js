@@ -5,9 +5,13 @@ const emailSender = process.env.EMAIL_SENDER;
 const passEmailSender = process.env.PASS_EMAIL_SENDER;
 const emailReceiver = process.env.EMAIL_RECEIVER;
 const logFileName = process.env.LOG_FILENAME;
-const idleThreshold = process.env.IDLE_THRESHOLD;
-const repeatAlertEvery = process.env.REPEAT_ALERT_EVERY;
-const deviceRunningTimeThreshold = process.env.DEVICE_RUNNING_TIME_THRESHOLD;
+const maxIdle = process.env.IDLE_THRESHOLD;
+const repeatMaxIdleAlertEvery = process.env.REPEAT_IDLE_ALERT_EVERY;
+const maxRun = process.env.DEVICE_RUNNING_TIME_THRESHOLD;
+const repeatMaxRunAlertEvery = process.env.REPEAT_RUNNING_ALERT_EVERY;
+
+
+
 const nbLineLogEmail = process.env.NB_LINE_LOG_EMAIL;
 
 //Cloud Api specific params
@@ -45,6 +49,7 @@ const transporter = nodemailer.createTransport({
 var monitoredDevice = {
   started: false,
   lastStartedTime: undefined,
+  lastStoppedTime: undefined,
   lastTimeInactivityAlert: undefined,
   lastTimeRunningAlert: undefined,
   usage: undefined,
@@ -54,34 +59,59 @@ var monitoredDevice = {
   init: function() {
     this.started = false;
     this.lastStartedTime = getDate();
+    this.lastStoppedTime = getDate();
     this.lastTimeInactivityAlert = getDate();
+    this.someInactivityAlertSent = false;
     this.lastTimeRunningAlert = getDate();
+    this.someTimeRunningAlertSent = false;
     this.usage = undefined;
   },
   isDeviceStarted: function() { return this.started; },
   isDeviceStopped: function() { return !this.started; },
   startDevice: function() { 
     this.started = true;
-    logger.info(aliasDevice + " Started");
+    logger.info(aliasDevice + " Started" + JSON.stringify(monitoredDevice.usage));
     sendEmail(aliasDevice + " Started");
-    this.lastStartedTime = getDate();  
+    this.lastStartedTime = getDate(); 
+    this.someTimeRunningAlertSent = false;
   },
   stopDevice: function() {
     this.started = false;
-    logger.info(aliasDevice + " Stopped");
-    sendEmail(aliasDevice + " stopped");
+    logger.info(aliasDevice + " Stopped" + JSON.stringify(monitoredDevice.usage));
+    sendEmail(aliasDevice + " Stopped");
+    this.lastStoppedTime = getDate();  
+    this.someInactivityAlertSent = false;
   }   
 }
 
 async function main() {   
-  loggerDebug.info("-----Monitoring started!-----");    
+  loggerDebug.info("Acceptable Inactivity             : " + (maxIdle/60).toFixed(2) + " minutes");
+  loggerDebug.info("Alert for  Inactivity every       : " + (repeatMaxIdleAlertEvery/60).toFixed(2) + " minutes");
+  loggerDebug.info("Acceptable Activity               : " + (maxRun/60).toFixed(2) + " minutes");
+  loggerDebug.info("Alert for Excessive activity every: " + (repeatMaxRunAlertEvery/60).toFixed(2) + " minutes");
+    
+  logger.info("Acceptable Inactivity             : " + (maxIdle/60).toFixed(2) + " minutes");
+  logger.info("Alert for  Inactivity every       : " + (repeatMaxIdleAlertEvery/60).toFixed(2) + " minutes");
+  logger.info("Acceptable Activity               : " + (maxRun/60).toFixed(2) + " minutes");
+  logger.info("Alert for Excessive activity every: " + (repeatMaxRunAlertEvery/60).toFixed(2) + " minutes");
+
   monitoredDevice.init();
 
   if(apiSelection == "cloud") {
     cloudApi();
+    	logger.info("-----Monitoring started!-----");
+  		logger.info("-----  using CLOUD API  -----");
+    	loggerDebug.info("-----Monitoring started!-----");
+  		loggerDebug.info("-----  using CLOUD API  -----");
+
   } 
   else {
     lanApi();
+    	logger.info("-----Monitoring started!-----");
+  		logger.info("-----   using LAN API   -----");
+    	loggerDebug.info("-----Monitoring started!-----");
+  		loggerDebug.info("-----   using LAN API   -----");
+
   }    
 }
 
@@ -145,16 +175,24 @@ const monitoring = function(usage) {
   } 
 }
 
-function verifyLastTimeStarted() {  
-  if (getDate() - monitoredDevice.lastTimeInactivityAlert >= repeatAlertEvery &&
-   getDate() - monitoredDevice.lastStartedTime >= idleThreshold) {      
-    sendEmail(aliasDevice + " didn't start for the last " + (getDate() - monitoredDevice.lastStartedTime)/60 + " minutes");    
-    monitoredDevice.lastTimeInactivityAlert = getDate();
+function verifyLastTimeStarted() { 
+  sinceInactivityAlert = getDate() - monitoredDevice.lastTimeInactivityAlert;
+  sinceLastStop = getDate() - monitoredDevice.lastStoppedTime;
+  msg = aliasDevice + " didn't start for the last " + (sinceLastStop/60).toFixed(2) + " minutes";
+  if (monitoredDevice.isDeviceStopped()) {
+    if ( (monitoredDevice.someInactivityAlertSent && (sinceInactivityAlert >= repeatMaxIdleAlertEvery))|| (!monitoredDevice.someInactivityAlertSent &&(sinceLastStop >= maxIdle))) {      
+      loggerDebug.info(msg);
+      logger.info(msg);
+      sendEmail(msg);
+      monitoredDevice.lastTimeInactivityAlert = getDate();
+      monitoredDevice.someInactivityAlertSent = true;
+    }
   }
 }
 
 function verifyStartStop() {
-  if (monitoredDevice.getPower() > powerThreshold) {            
+  let power = ('power' in monitoredDevice.usage ? monitoredDevice.usage.power : monitoredDevice.usage.power_mw);  
+  if (power > powerThreshold) {            
     if (monitoredDevice.isDeviceStopped()) {
         monitoredDevice.startDevice();        
     }
@@ -165,10 +203,17 @@ function verifyStartStop() {
 }
 
 function verifyRunningTime() {
-  if (getDate() - monitoredDevice.lastTimeRunningAlert >= repeatAlertEvery &&
-    monitoredDevice.isDeviceStarted() && getDate() - monitoredDevice.lastStartedTime >= deviceRunningTimeThreshold) {
-    sendEmail(aliasDevice + " running for more then " + (getDate() - monitoredDevice.lastStartedTime)/60 + " minutes");    
-    monitoredDevice.lastTimeRunningAlert = getDate();
+  var sinceAlert = getDate() - monitoredDevice.lastTimeRunningAlert;
+  var sinceStart = getDate() - monitoredDevice.lastStartedTime;
+  var msg = aliasDevice + " running for more then " + (sinceStart/60).toFixed(2) + " minutes";
+  if (monitoredDevice.isDeviceStarted()) {
+  	if ((monitoredDevice.someTimeRunningAlertSent && (sinceAlert >= repeatMaxRunAlertEvery))|| (!monitoredDevice.someTimeRunningAlertSent && (sinceStart >= maxRun))) {
+      loggerDebug.info(msg);
+      logger.info(msg);
+      sendEmail(msg);
+      monitoredDevice.lastTimeRunningAlert = getDate();
+      monitoredDevice.someTimeRunningAlertSent = true;
+    }
   }
 }
 
